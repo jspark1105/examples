@@ -18,6 +18,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import numpy as np
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -74,6 +75,8 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('--regularizer', default='l2', type=str, help='which norm is used for regularizer (l1 or l2)')
+parser.add_argument('--prune-threshold', default=None, type=float, help='prune disabled when None or 0')
 
 best_acc1 = 0
 
@@ -171,7 +174,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+                                weight_decay=(0 if args.regularizer == "l1" else args.weight_decay))
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -279,6 +282,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         output = model(input)
         loss = criterion(output, target)
 
+        if args.regularizer == "l1":
+            l1_regularization = torch.tensor(0.0).cuda(args.gpu)
+            for param in model.parameters():
+                l1_regularization += torch.norm(param, 1)
+            loss += args.weight_decay * l1_regularization
+
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
@@ -289,6 +298,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        if args.prune_threshold and args.prune_threshold > 0:
+            for param in model.parameters():
+                mask = np.abs(param.data.cpu()) < args.prune_threshold
+                param.data[mask] = 0.0
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -313,6 +327,9 @@ def validate(val_loader, model, criterion, args):
 
     # switch to evaluate mode
     model.eval()
+
+    for name, params in model.named_parameters():
+        print('sparsity of {} is {}'.format(name, float((params.data.cpu() == 0).sum()) / params.data.numel()))
 
     with torch.no_grad():
         end = time.time()
