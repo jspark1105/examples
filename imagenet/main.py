@@ -78,8 +78,9 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--regularizer', default='l2', type=str, help='which norm is used for regularizer (l1 or l2)')
 parser.add_argument('--prune-threshold', default=None, type=float, help='prune disabled when None or 0')
 parser.add_argument('--prune-ratio', default=0, type=float, help='the percent of weight parameters to prune for each layer')
-parser.add_argument('--admm-iter', type=int, default=100)
+parser.add_argument('--admm-iter', type=int, default=1.5e6)
 parser.add_argument('--rho', type=float, default=3e-3)
+parser.add_argument('--prune-phase', type=str, default='admm', help='admm: suppress weights, retrain: set target weights to 0 and retrain')
 
 best_acc1 = 0
 
@@ -241,10 +242,13 @@ def main_worker(gpu, ngpus_per_node, args):
         return
 
     for name, param in model.named_parameters():
-        Z[name] = param.data.clone()
-        U[name] = param.data.clone()
+        Z[name] = param.detach().clone()
+        U[name] = param.detach().clone()
+        Z[name].requires_grad = False
+        U[name].requires_grad = False
         U[name].fill_(0)
-        zero[name] = param.data.clone()
+        zero[name] = param.detach().clone()
+        zero[name].requires_grad = False
         zero[name].fill_(0)
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -302,18 +306,21 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
                 l1_regularization += torch.norm(param, 1)
             loss += args.weight_decay * l1_regularization
 
-        if args.prune_ratio > 0:
+        if args.prune_phase == "admm" and (args.prune_ratio > 0 or args.prune_threshold > 0):
             for name, param in model.named_parameters():
                 if i % args.admm_iter == 0:
-                    Z[name] = param.data + U[name]
+                    Z[name].data = param.detach() + U[name].detach()
                     Z_abs = Z[name].detach().abs()
-                    n = int(args.prune_ratio * param.data.numel())
-                    threshold = float(Z_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
+                    if args.prune_threshold > 0:
+                        threshold = args.prune_threshold
+                    else:
+                        n = int(args.prune_ratio * param.detach().numel())
+                        threshold = float(Z_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
                     Z[name].data = torch.where(Z_abs > threshold, Z[name], zero[name])
                     if i > 0:
-                        U[name] += param - Z[name]
+                        U[name].data = U[name].detach() + param.detach() - Z[name].detach()
 
-                loss += args.rho / 2 * torch.norm(param - Z[name] + U[name], 2)
+                loss += args.rho / 2 * torch.norm(param.detach() - Z[name].detach() + U[name].detach(), 2)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -326,16 +333,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         loss.backward()
         optimizer.step()
 
-        if args.prune_ratio > 0:
-            for name, param in model.named_parameters():
-                W_abs = param.detach().abs()
-                n = int(args.prune_ratio * param.data.numel())
-                threshold = float(W_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
-                param.data = torch.where(W_abs > threshold, param.data, zero[name])
-        elif args.prune_threshold and args.prune_threshold > 0:
-            for param in model.parameters():
-                mask = np.abs(param.data.cpu()) < args.prune_threshold
-                param.data[mask] = 0.0
+        if args.prune_phase == "retrain":
+            if args.prune_ratio > 0:
+                for name, param in model.named_parameters():
+                    W_abs = param.detach().abs()
+                    n = int(args.prune_ratio * param.detach().numel())
+                    threshold = float(W_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
+                    param.data = torch.where(W_abs > threshold, param.detach(), zero[name])
+            elif args.prune_threshold and args.prune_threshold > 0:
+                for param in model.parameters():
+                    mask = np.abs(param.detach().cpu()) < args.prune_threshold
+                    param.data[mask] = 0.0
 
         # measure elapsed time
         batch_time.update(time.time() - end)
