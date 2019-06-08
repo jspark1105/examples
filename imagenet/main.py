@@ -81,12 +81,15 @@ parser.add_argument('--prune-ratio', default=0, type=float, help='the percent of
 parser.add_argument('--admm-iter', type=int, default=1.5e6)
 parser.add_argument('--rho', type=float, default=3e-3)
 parser.add_argument('--prune-phase', type=str, default='admm', help='admm: suppress weights, retrain: set target weights to 0 and retrain')
+parser.add_argument('--skip-prune-first-conv', type=int, default=1)
+parser.add_argument('--prune-bias', action='store_true')
 
 best_acc1 = 0
 
 Z = {}
 U = {}
 zero = {}
+global_iteration = 0
 
 
 def main():
@@ -277,6 +280,33 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best)
 
 
+# A slight variation of module.named_parameters() that only filters parameters
+# of Conv2d and Linear
+def conv_fc_named_parameters(model, prefix=''):
+    memo = set()
+    modules = model.named_modules(prefix=prefix)
+    for module_prefix, module in modules:
+        if not(isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear)):
+            continue
+        members = module.named_parameters(recurse=False)
+        for k, v in members:
+            if v is None or v in memo:
+                continue
+            memo.add(v)
+            name = module_prefix + ('.' if module_prefix else '') + k
+            yield name, v
+
+
+def get_named_parameters_to_prune(model, args):
+    named_parameters_to_prune = conv_fc_named_parameters(model)
+    if args.skip_prune_first_conv:
+        # HACK: this assumes there's at least one Conv before the first FC
+        named_parameters_to_prune = list(named_parameters_to_prune)[1:]
+    if not args.prune_bias:
+        named_parameters_to_prune = [(name, parameter) for name, parameter in named_parameters_to_prune if 'bias' not in name]
+    return named_parameters_to_prune
+
+
 def train(train_loader, model, criterion, optimizer, epoch, args):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -286,6 +316,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
     # switch to train mode
     model.train()
+
+    named_parameters_to_prune = get_named_parameters_to_prune(model, args)
+    global global_iteration
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
@@ -307,8 +340,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             loss += args.weight_decay * l1_regularization
 
         if args.prune_phase == "admm" and (args.prune_ratio > 0 or args.prune_threshold > 0):
-            for name, param in model.named_parameters():
-                if i % args.admm_iter == 0:
+            for name, param in named_parameters_to_prune:
+                if global_iteration % args.admm_iter == 0:
                     Z[name].data = param.detach() + U[name].detach()
                     Z_abs = Z[name].detach().abs()
                     if args.prune_threshold > 0:
@@ -317,7 +350,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
                         n = int(args.prune_ratio * param.detach().numel())
                         threshold = float(Z_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
                     Z[name].data = torch.where(Z_abs > threshold, Z[name], zero[name])
-                    if i > 0:
+                    if global_iteration > 0:
                         U[name].data = U[name].detach() + param.detach() - Z[name].detach()
 
                 loss += args.rho / 2 * torch.norm(param.detach() - Z[name].detach() + U[name].detach(), 2)
@@ -335,7 +368,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if args.prune_phase == "retrain":
             if args.prune_ratio > 0:
-                for name, param in model.named_parameters():
+                for name, param in named_parameters_to_prune:
                     W_abs = param.detach().abs()
                     n = int(args.prune_ratio * param.detach().numel())
                     threshold = float(W_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
@@ -359,6 +392,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
 
+        global_iteration += 1
+
 
 def validate(val_loader, model, criterion, args):
     batch_time = AverageMeter()
@@ -369,7 +404,7 @@ def validate(val_loader, model, criterion, args):
     # switch to evaluate mode
     model.eval()
 
-    for name, params in model.named_parameters():
+    for name, params in get_named_parameters_to_prune(model, args):
         print('sparsity of {} is {}'.format(name, float((params.data.cpu() == 0).sum()) / params.data.numel()))
 
     with torch.no_grad():
