@@ -89,6 +89,7 @@ best_acc1 = 0
 Z = {}
 U = {}
 zero = {}
+mask = {}
 global_iteration = 0
 
 
@@ -344,11 +345,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
                 if global_iteration % args.admm_iter == 0:
                     Z[name].data = param.detach() + U[name].detach()
                     Z_abs = Z[name].detach().abs()
-                    if args.prune_threshold > 0:
-                        threshold = args.prune_threshold
-                    else:
+                    if args.prune_ratio > 0:
                         n = int(args.prune_ratio * param.detach().numel())
                         threshold = float(Z_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
+                    else:
+                        threshold = args.prune_threshold
                     Z[name].data = torch.where(Z_abs > threshold, Z[name], zero[name])
                     if global_iteration > 0:
                         U[name].data = U[name].detach() + param.detach() - Z[name].detach()
@@ -367,16 +368,17 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         optimizer.step()
 
         if args.prune_phase == "retrain":
-            if args.prune_ratio > 0:
+            if args.prune_ratio > 0 or (args.prune_threshold and args.prune_threshold > 0):
                 for name, param in named_parameters_to_prune:
                     W_abs = param.detach().abs()
-                    n = int(args.prune_ratio * param.detach().numel())
-                    threshold = float(W_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
-                    param.data = torch.where(W_abs > threshold, param.detach(), zero[name])
-            elif args.prune_threshold and args.prune_threshold > 0:
-                for param in model.parameters():
-                    mask = np.abs(param.detach().cpu()) < args.prune_threshold
-                    param.data[mask] = 0.0
+                    if global_iteration == 0:
+                        if args.prune_ratio > 0:
+                            n = int(args.prune_ratio * param.detach().numel())
+                            threshold = float(W_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
+                        else:
+                            threshold = args.prune_threshold
+                        mask[name] = W_abs < threshold
+                    param.data[mask[name]] = 0.0
 
         # measure elapsed time
         batch_time.update(time.time() - end)
