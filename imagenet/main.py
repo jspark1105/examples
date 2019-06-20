@@ -78,7 +78,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--regularizer', default='l2', type=str, help='which norm is used for regularizer (l1 or l2)')
 parser.add_argument('--prune-threshold', default=None, type=float, help='prune disabled when None or 0')
 parser.add_argument('--prune-ratio', default=0, type=float, help='the percent of weight parameters to prune for each layer')
-parser.add_argument('--admm-iter', type=int, default=1.5e6)
+parser.add_argument('--admm-per-n-epochs', type=int, default=15, help="apply ADMM per this number of epochs")
 parser.add_argument('--rho', type=float, default=3e-3)
 parser.add_argument('--prune-phase', type=str, default='admm', help='admm: suppress weights, retrain: set target weights to 0 and retrain')
 parser.add_argument('--skip-prune-first-conv', type=int, default=1)
@@ -342,7 +342,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if args.prune_phase == "admm" and (args.prune_ratio > 0 or args.prune_threshold > 0):
             for name, param in named_parameters_to_prune:
-                if global_iteration % args.admm_iter == 0:
+                if epoch % args.admm_per_n_epochs == 0:
                     Z[name].data = param.detach() + U[name].detach()
                     Z_abs = Z[name].detach().abs()
                     if args.prune_ratio > 0:
