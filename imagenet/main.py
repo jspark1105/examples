@@ -342,7 +342,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if args.prune_phase == "admm" and (args.prune_ratio > 0 or args.prune_threshold > 0):
             for name, param in named_parameters_to_prune:
-                if epoch % args.admm_per_n_epochs == 0:
+                if epoch % args.admm_per_n_epochs == 0 and i == 0:
                     Z[name].data = param.detach() + U[name].detach()
                     Z_abs = Z[name].detach().abs()
                     if args.prune_ratio > 0:
