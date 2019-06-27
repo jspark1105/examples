@@ -354,7 +354,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
                     if global_iteration > 0:
                         U[name].data = U[name].detach() + param.detach() - Z[name].detach()
 
-                norm = torch.norm(param.detach() - Z[name].detach() + U[name].detach(), 2)
+                norm = torch.norm(param - Z[name].detach() + U[name].detach(), 2)
                 loss += args.rho / 2 * norm * norm
 
         # measure accuracy and record loss
