@@ -83,10 +83,13 @@ parser.add_argument('--rho', type=float, default=3e-3)
 parser.add_argument('--prune-phase', type=str, default='admm', help='admm: suppress weights, retrain: set target weights to 0 and retrain')
 parser.add_argument('--skip-prune-first-conv', type=int, default=1)
 parser.add_argument('--prune-bias', action='store_true')
+parser.add_argument('--schedule', type=str, default='default', help='learning rate schedule')
 
 best_acc1 = 0
 
 Z = {}
+Z_new = {}
+dZ = {}  # difference of Z across iterations
 U = {}
 zero = {}
 mask = {}
@@ -129,7 +132,7 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
-    global best_acc1
+    global best_acc1, Z, Z_new, U, zero, mask
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -200,6 +203,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 best_acc1 = best_acc1.to(args.gpu)
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+            Z = {k: v.cuda() for k, v in checkpoint['Z'].items()}
+            Y = {k: v.cuda() for k, v in checkpoint['U'].items()}
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -246,14 +251,22 @@ def main_worker(gpu, ngpus_per_node, args):
         return
 
     for name, param in model.named_parameters():
-        Z[name] = param.detach().clone()
-        U[name] = param.detach().clone()
+        if not (args.resume and os.path.isfile(args.resume)):
+            Z[name] = param.detach().clone()
+            U[name] = param.detach().clone()
+
+        Z_new[name] = param.detach().clone()
         Z[name].requires_grad = False
+        Z_new[name].requires_grad = False
         U[name].requires_grad = False
-        U[name].fill_(0)
+
         zero[name] = param.detach().clone()
         zero[name].requires_grad = False
+
+        if not (args.resume and os.path.isfile(args.resume)):
+            U[name].fill_(0)
         zero[name].fill_(0)
+        dZ[name] = 0.0
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -278,6 +291,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
+                'Z': {k: v.cpu() for k, v in Z.items()},
+                'U': {k: v.cpu() for k, v in U.items()},
             }, is_best)
 
 
@@ -319,7 +334,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     named_parameters_to_prune = get_named_parameters_to_prune(model, args)
-    global global_iteration
+    global Z, Z_new, dZ, U, zero, mask, global_iteration
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
@@ -343,14 +358,23 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         if args.prune_phase == "admm" and (args.prune_ratio > 0 or args.prune_threshold > 0):
             for name, param in named_parameters_to_prune:
                 if epoch % args.admm_per_n_epochs == 0 and i == 0:
-                    Z[name].data = param.detach() + U[name].detach()
-                    Z_abs = Z[name].detach().abs()
+                    # Compute Z_{k+1}
+                    Z_new[name].data = param.detach() + U[name].detach()
+                    Z_abs = Z_new[name].detach().abs()
                     if args.prune_ratio > 0:
                         n = int(args.prune_ratio * param.detach().numel())
                         threshold = float(Z_abs.flatten().kthvalue(n - 1).values.cpu().numpy())
                     else:
                         threshold = args.prune_threshold
-                    Z[name].data = torch.where(Z_abs > threshold, Z[name], zero[name])
+                    Z_new[name].data = torch.where(Z_abs > threshold, Z_new[name].detach(), zero[name].detach())
+
+                    # Compute sum of squares of Z_{k+1} - Z_{k}
+                    dZ[name] = torch.norm(Z_new[name].detach() - Z[name].detach(), 2)
+                    dZ[name] = dZ[name] * dZ[name]
+
+                    # Copy Z_{k+1} to Z_{k}
+                    Z[name].data = Z_new[name].detach() + zero[name].detach()
+
                     if global_iteration > 0:
                         U[name].data = U[name].detach() + param.detach() - Z[name].detach()
 
@@ -404,11 +428,16 @@ def validate(val_loader, model, criterion, args):
     top1 = AverageMeter()
     top5 = AverageMeter()
 
+    global Z, dZ, U
+
     # switch to evaluate mode
     model.eval()
 
     for name, params in get_named_parameters_to_prune(model, args):
-        print('sparsity of {} is {}'.format(name, float((params.data.cpu() == 0).sum()) / params.data.numel()))
+        sparsity = float((param.detach().cpu() == 0).sum()) / params.data.numel()
+        if args.prune_phase == "admm":
+            norm = torch.norm(param.detach() - Z[name].detach(), 2)
+            print('{} : sparsity {} ||W-Z||^2 {} ||Z_k+1-Z_k||^2 {}'.format(name, sparsity, norm * norm, dZ[name].detach()))
 
     with torch.no_grad():
         end = time.time()
@@ -472,7 +501,7 @@ class AverageMeter(object):
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 30))
+    lr = args.lr if args.schedule == "constant" else lr = args.lr * (0.1 ** (epoch // 30))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
